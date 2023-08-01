@@ -17,7 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def max_fn(x, y):
     return tl.math.max(x, y)
@@ -26,7 +25,7 @@ def max_fn(x, y):
 @triton.jit
 def _fwd_kernel(
     Q, K, V, sm_scale,
-    L,
+    L,                          
     Out,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
@@ -37,6 +36,11 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
+    # (batch_size, n_head, sequence_length, head dim )
+    # grid: sequence_length / BLOCK_M, batch_size * num_heads, 1
+    # BLOCK_M = 128
+    # BLOCK_N = 64
+    # BLOCK_DMODEL = head_size
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     q_offset = off_hz * stride_qh
@@ -65,8 +69,11 @@ def _fwd_kernel(
         block_shape=(BLOCK_N, BLOCK_DMODEL),
         order=(1, 0)
     )
+    # order:内存布局与矩阵axis轴的关系，由内到外对应关系
     # initialize offsets
+    # 列方向的偏移量
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # 行方向的偏移量
     offs_n = tl.arange(0, BLOCK_N)
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -75,21 +82,29 @@ def _fwd_kernel(
     # scale sm_scale by log_2(e) and use
     # 2^x instead of exp in the loop because CSE and LICM
     # don't work as expected with `exp` in the loop
+    # CSE：公共子表达式消除
+    # LICM：循环不变代码外提
     qk_scale = sm_scale * 1.44269504
     # load q: it will stay in SRAM throughout
+    # 矩阵Group方式
     q = tl.load(Q_block_ptr)
+    # 
     q = (q * qk_scale).to(tl.float16)
     # loop over k, v and update accumulator
     lo = 0
+    # hi计算，如果是causal的话，hi = start_m * BLOCK_M + BLOCK_M
+    # 无关联的token不再计算，减少计算量
     hi = P_SEQ + (start_m + 1) * BLOCK_M if IS_CAUSAL else N_CTX + P_SEQ
     for start_n in range(lo, hi, BLOCK_N):
         # -- load k, v --
         k = tl.load(K_block_ptr)
         v = tl.load(V_block_ptr)
         # -- compute qk ---
+        # 只取已有位置的token计算
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float16)
         if IS_CAUSAL:
             qk = tl.where(P_SEQ + offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+        # k方向累加计算
         qk += tl.dot(q, k, out_dtype=tl.float16)
         # -- compute scaling constant ---
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -106,6 +121,8 @@ def _fwd_kernel(
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
     # write back l and m
     acc = acc / l_i[:, None]
+    # L: batch_size * num_heads, sequence_length
+    # logsumexp L: offset
     l_ptrs = L + off_hz * N_CTX + offs_m
     tl.store(l_ptrs, m_i + tl.math.log2(l_i))
     # write back O
@@ -117,6 +134,7 @@ def _fwd_kernel(
         block_shape=(BLOCK_M, BLOCK_DMODEL),
         order=(1, 0)
     )
+    # 存储转为float16半精度
     tl.store(O_block_ptr, acc.to(tl.float16))
 
 
@@ -237,6 +255,7 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
         # shape constraints
+        # Z, H, N_CTX, D_HEAD = 6, 9, 1024, 64
         Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
         assert Lq == Lk and Lk == Lv
         assert Lk in {16, 32, 64, 128}
@@ -245,7 +264,9 @@ class _attention(torch.autograd.Function):
         BLOCK_N = 64 if Lk <= 64 else 32
         num_stages = 4 if Lk <= 64 else 3
         num_warps = 4
+        # sequence_length / BLOCK_M, batch_size * num_heads, 1
         grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        # batch_size * num_heads, sequence_length
         L = torch.empty((q.shape[0] * q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         P_SEQ = 0 if q.shape[-2] == k.shape[-2] else k.shape[-2] - q.shape[-2]
         _fwd_kernel[grid](
@@ -309,6 +330,7 @@ attention = _attention.apply
 @pytest.mark.parametrize('causal', [False, True])
 def test_op(Z, H, N_CTX, D_HEAD, P_SEQ, causal, dtype=torch.float16):
     torch.manual_seed(20)
+    # Z, H, N_CTX, D_HEAD = 6, 9, 1024, 64
     q = torch.empty((Z, H, N_CTX, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     k = torch.empty((Z, H, N_CTX + P_SEQ, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
     v = torch.empty((Z, H, N_CTX + P_SEQ, D_HEAD), dtype=dtype, device="cuda").normal_(mean=0., std=0.5).requires_grad_()
@@ -317,8 +339,10 @@ def test_op(Z, H, N_CTX, D_HEAD, P_SEQ, causal, dtype=torch.float16):
     # reference implementation
     M = torch.tril(torch.ones((N_CTX, N_CTX + P_SEQ), device="cuda"), diagonal=P_SEQ)
     p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    # 只取上三角矩阵的值
     if causal:
         p[:, :, M == 0] = float("-inf")
+    # 矩阵形状： (batch_size, n_head, sequence_length, sequence_length)
     p = torch.softmax(p.float(), dim=-1).half()
     # p = torch.exp(p)
     ref_out = torch.matmul(p, v)

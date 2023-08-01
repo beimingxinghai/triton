@@ -132,14 +132,26 @@ def matmul_kernel_with_block_pointers(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     # See the matrix multiplication tutorial for details.
+    # 还是用分组的方式，提升L2的数据重用
+    # 先计算A矩阵GROUP_SIZE_M组内的每一行与B矩阵第x列的乘积，然后再计算下一个A矩阵GROUP_SIZE_M组结果
+    # 相当于按照column-maijor的方式分组计算，每组的行数为GROUP_SIZE_M
+    # 找到当前块在结果矩阵中的块id
     pid = tl.program_id(axis=0)
+    # 结果矩阵列方向的块总数
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    # 结果矩阵行方向的块总数
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    # 每个分组的块数，组合方式为M个列方向块总数 * 行方向块总数
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    # 以组作为除数分割，得到当前块的组id, //含义：floordiv
     group_id = pid // num_pid_in_group
+    # 得到当前块所在组的列方向的起始块id，得到起始值
     first_pid_m = group_id * GROUP_SIZE_M
+    # 当前所在块ID所在的组列方向可能数量不足GROUP_SIZE_M，所以需要取最小值得出实际组内列方向块数
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    # 得到当前块的列方向块id
     pid_m = first_pid_m + (pid % group_size_m)
+    # 得到当前块的行方向块id
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     # ----------------------------------------------------------
@@ -158,7 +170,9 @@ def matmul_kernel_with_block_pointers(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block.
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
+    # 中间块结果使用高精度的fp32，最后再转换为fp16
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Iterate over the K dimension.
     for k in range(0, K, BLOCK_SIZE_K):
         # Load with boundary checks, no need to calculate the mask manually.
         # For better performance, you may remove some axis from the boundary
@@ -196,6 +210,7 @@ def matmul(a, b):
     # Allocates output.
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     # 1D launch kernel where each block gets its own program.
+    # 按照列和行方向分别分割，总数为分割后的总块数
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
     )

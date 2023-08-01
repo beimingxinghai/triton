@@ -35,17 +35,22 @@ def add_kernel(
 ):
     # There are multiple 'programs' processing different data. We identify which program
     # we are here:
+    # 按照BLOCK_SIZE划分数据，每个program处理BLOCK_SIZE个数据
+    # program是个概念，不是真正的线程
     pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
     # This program will process inputs that are offset from the initial data.
     # For instance, if you had a vector of length 256 and block_size of 64, the programs
     # would each access the elements [0:64, 64:128, 128:192, 192:256].
     # Note that offsets is a list of pointers:
+    # 每个program处理的数据的起始地址
     block_start = pid * BLOCK_SIZE
+    # block块内的偏移量
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     # Create a mask to guard memory operations against out-of-bounds accesses.
     mask = offsets < n_elements
     # Load x and y from DRAM, masking out any extra elements in case the input is not a
     # multiple of the block size.
+    # mask是一个bool类型的tensor，mask为True的位置，对应的数据会被加载到x和y中
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
     output = x + y

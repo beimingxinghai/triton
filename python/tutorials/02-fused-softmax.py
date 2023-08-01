@@ -35,12 +35,15 @@ def naive_softmax(x):
     this shift.
     """
     # read  MN elements ; write M  elements
+    # output tensors (max, max_indices) are allocated implicitly
     x_max = x.max(dim=1)[0]
     # read MN + M elements ; write MN elements
     z = x - x_max[:, None]
     # read  MN elements ; write MN elements
+    # 计算矩阵每个元素的指数
     numerator = torch.exp(z)
     # read  MN elements ; write M  elements
+    # 计算分母
     denominator = numerator.sum(dim=1)
     # read MN + M elements ; write MN elements
     ret = numerator / denominator[:, None]
